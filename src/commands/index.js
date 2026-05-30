@@ -1,51 +1,56 @@
 /**
  * Command Handler for WhatsApp Bot
  * Handles all commands with . prefix
+ * Supports multiple sessions (each user has their own bot)
  */
 
-const config = require('../../config');
-const Wbails = require('../utils/wbails');
+const config = require('../config');
+const Wbails = require('./utils/wbails');
 const fs = require('fs');
 const path = require('path');
 
 // ─── Group Settings Storage ──────────────────────────────────
-const SETTINGS_FILE = path.join(__dirname, '..', '..', 'groupSettings.json');
+const SETTINGS_DIR = path.join(__dirname, '..', 'sessions');
 
-function loadSettings() {
+function getSettingsPath(sessionPhone) {
+  const dir = path.join(SETTINGS_DIR, sessionPhone);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, 'groupSettings.json');
+}
+
+function loadSettings(sessionPhone) {
   try {
-    if (fs.existsSync(SETTINGS_FILE)) {
-      return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+    const file = getSettingsPath(sessionPhone);
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, 'utf-8'));
     }
-  } catch (e) {
-    console.error('Error loading settings:', e);
-  }
+  } catch (e) {}
   return {};
 }
 
-function saveSettings(settings) {
+function saveSettings(sessionPhone, settings) {
   try {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
-  } catch (e) {
-    console.error('Error saving settings:', e);
-  }
+    const file = getSettingsPath(sessionPhone);
+    fs.writeFileSync(file, JSON.stringify(settings, null, 2));
+  } catch (e) {}
 }
 
-function getGroupSettings(groupId) {
-  const settings = loadSettings();
+function getGroupSettings(sessionPhone, groupId) {
+  const settings = loadSettings(sessionPhone);
   if (!settings[groupId]) {
-    settings[groupId] = { antilink: false, welcome: false, welcomeMsg: '' };
-    saveSettings(settings);
+    settings[groupId] = { antilink: false, welcome: false };
+    saveSettings(sessionPhone, settings);
   }
   return settings[groupId];
 }
 
-function setGroupSettings(groupId, key, value) {
-  const settings = loadSettings();
+function setGroupSettings(sessionPhone, groupId, key, value) {
+  const settings = loadSettings(sessionPhone);
   if (!settings[groupId]) {
-    settings[groupId] = { antilink: false, welcome: false, welcomeMsg: '' };
+    settings[groupId] = { antilink: false, welcome: false };
   }
   settings[groupId][key] = value;
-  saveSettings(settings);
+  saveSettings(sessionPhone, settings);
   return settings[groupId];
 }
 
@@ -53,9 +58,7 @@ function setGroupSettings(groupId, key, value) {
 
 function getText(msg) {
   if (!msg.message) return '';
-
   const type = Object.keys(msg.message)[0];
-
   switch (type) {
     case 'conversation':
       return msg.message.conversation || '';
@@ -98,6 +101,7 @@ function formatUptime(ms) {
 // ─── Command Map ─────────────────────────────────────────────
 
 const commands = {
+
   // ═══════════════════════════════════════════
   //  GENERAL COMMANDS
   // ═══════════════════════════════════════════
@@ -106,7 +110,7 @@ const commands = {
     name: 'ping',
     description: 'Check bot speed',
     category: 'general',
-    handler: async (sock, msg, args) => {
+    handler: async (sock, msg, args, sessionPhone) => {
       const start = Date.now();
       const jid = msg.key.remoteJid;
       const sent = await sock.sendMessage(jid, { text: '🏓 Pinging...' }, { quoted: msg });
@@ -122,7 +126,7 @@ const commands = {
     name: 'dev',
     description: 'Developer info',
     category: 'general',
-    handler: async (sock, msg) => {
+    handler: async (sock, msg, args, sessionPhone) => {
       const jid = msg.key.remoteJid;
       const text = `
 👨‍💻 *Developer Info*
@@ -155,7 +159,6 @@ _Made with ❤️ by ${config.OWNER_NAME}_
 💾 *Memory:* ${mem} MB
 🔧 *Node:* ${process.version}
 🟢 *Status:* Online & Running
-📅 *Started:* ${new Date(config.startTime).toLocaleString()}
 
 _Type ${config.PREFIX}menu for commands_
       `.trim();
@@ -287,14 +290,11 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
         const metadata = await sock.groupMetadata(jid);
         const admins = metadata.participants.filter(p => p.admin);
         let text = `👑 *Group Admins (${admins.length})*\n\n`;
-        admins.forEach((admin, i) => {
+        admins.forEach((admin) => {
           const role = admin.admin === 'superadmin' ? '🌟' : '👑';
           text += `${role} @${admin.id.split('@')[0]}\n`;
         });
-        await sock.sendMessage(jid, {
-          text,
-          mentions: admins.map(a => a.id),
-        }, { quoted: msg });
+        await sock.sendMessage(jid, { text, mentions: admins.map(a => a.id) }, { quoted: msg });
       } catch (e) {
         await sock.sendMessage(jid, { text: '❌ Could not fetch admins.' }, { quoted: msg });
       }
@@ -315,13 +315,8 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
         const message = args || '';
         let text = `📢 *TAG ALL*\n\n`;
         if (message) text += `${message}\n\n`;
-        participants.forEach(p => {
-          text += `@${p.id.split('@')[0]}\n`;
-        });
-        await sock.sendMessage(jid, {
-          text,
-          mentions: participants.map(p => p.id),
-        }, { quoted: msg });
+        participants.forEach(p => { text += `@${p.id.split('@')[0]}\n`; });
+        await sock.sendMessage(jid, { text, mentions: participants.map(p => p.id) }, { quoted: msg });
       } catch (e) {
         await sock.sendMessage(jid, { text: '❌ Could not tag all.' }, { quoted: msg });
       }
@@ -340,10 +335,7 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
         const metadata = await sock.groupMetadata(jid);
         const participants = metadata.participants;
         const message = args || 'Attention everyone!';
-        await sock.sendMessage(jid, {
-          text: message,
-          mentions: participants.map(p => p.id),
-        }, { quoted: msg });
+        await sock.sendMessage(jid, { text: message, mentions: participants.map(p => p.id) }, { quoted: msg });
       } catch (e) {
         await sock.sendMessage(jid, { text: '❌ Could not hidetag.' }, { quoted: msg });
       }
@@ -352,7 +344,7 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
 
   promote: {
     name: 'promote',
-    description: 'Promote member to admin (reply to message)',
+    description: 'Promote member to admin (reply)',
     category: 'group',
     groupOnly: true,
     adminOnly: true,
@@ -360,20 +352,13 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
       const jid = msg.key.remoteJid;
       try {
         const target = msg.message?.extendedTextMessage?.contextInfo?.participant
-          || (msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0]);
-
+          || msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
         if (!target) {
-          await sock.sendMessage(jid, {
-            text: '❌ Reply to a message or tag the person you want to promote.',
-          }, { quoted: msg });
+          await sock.sendMessage(jid, { text: '❌ Reply to a message or tag the person you want to promote.' }, { quoted: msg });
           return;
         }
-
         await sock.groupParticipantsUpdate(jid, [target], 'promote');
-        await sock.sendMessage(jid, {
-          text: `✅ @${target.split('@')[0]} has been promoted to admin!`,
-          mentions: [target],
-        }, { quoted: msg });
+        await sock.sendMessage(jid, { text: `✅ @${target.split('@')[0]} has been promoted to admin!`, mentions: [target] }, { quoted: msg });
       } catch (e) {
         await sock.sendMessage(jid, { text: '❌ Failed to promote. Make sure I am admin.' }, { quoted: msg });
       }
@@ -382,7 +367,7 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
 
   demote: {
     name: 'demote',
-    description: 'Demote admin (reply to message)',
+    description: 'Demote admin (reply)',
     category: 'group',
     groupOnly: true,
     adminOnly: true,
@@ -390,20 +375,13 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
       const jid = msg.key.remoteJid;
       try {
         const target = msg.message?.extendedTextMessage?.contextInfo?.participant
-          || (msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0]);
-
+          || msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
         if (!target) {
-          await sock.sendMessage(jid, {
-            text: '❌ Reply to a message or tag the person you want to demote.',
-          }, { quoted: msg });
+          await sock.sendMessage(jid, { text: '❌ Reply to a message or tag the person you want to demote.' }, { quoted: msg });
           return;
         }
-
         await sock.groupParticipantsUpdate(jid, [target], 'demote');
-        await sock.sendMessage(jid, {
-          text: `✅ @${target.split('@')[0]} has been demoted from admin.`,
-          mentions: [target],
-        }, { quoted: msg });
+        await sock.sendMessage(jid, { text: `✅ @${target.split('@')[0]} has been demoted from admin.`, mentions: [target] }, { quoted: msg });
       } catch (e) {
         await sock.sendMessage(jid, { text: '❌ Failed to demote. Make sure I am admin.' }, { quoted: msg });
       }
@@ -412,7 +390,7 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
 
   kick: {
     name: 'kick',
-    description: 'Remove member from group (reply to message)',
+    description: 'Remove member (reply)',
     category: 'group',
     groupOnly: true,
     adminOnly: true,
@@ -420,20 +398,13 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
       const jid = msg.key.remoteJid;
       try {
         const target = msg.message?.extendedTextMessage?.contextInfo?.participant
-          || (msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0]);
-
+          || msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
         if (!target) {
-          await sock.sendMessage(jid, {
-            text: '❌ Reply to a message or tag the person you want to kick.',
-          }, { quoted: msg });
+          await sock.sendMessage(jid, { text: '❌ Reply to a message or tag the person you want to kick.' }, { quoted: msg });
           return;
         }
-
         await sock.groupParticipantsUpdate(jid, [target], 'remove');
-        await sock.sendMessage(jid, {
-          text: `✅ @${target.split('@')[0]} has been removed from the group.`,
-          mentions: [target],
-        }, { quoted: msg });
+        await sock.sendMessage(jid, { text: `✅ @${target.split('@')[0]} has been removed.`, mentions: [target] }, { quoted: msg });
       } catch (e) {
         await sock.sendMessage(jid, { text: '❌ Failed to kick. Make sure I am admin.' }, { quoted: msg });
       }
@@ -446,25 +417,23 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
 
   antilink: {
     name: 'antilink',
-    description: 'Toggle anti-link detection',
+    description: 'Toggle anti-link',
     category: 'settings',
     groupOnly: true,
     adminOnly: true,
-    handler: async (sock, msg, args) => {
+    handler: async (sock, msg, args, sessionPhone) => {
       const jid = msg.key.remoteJid;
-      const current = getGroupSettings(jid);
+      const current = getGroupSettings(sessionPhone, jid);
 
       if (args === 'on') {
-        setGroupSettings(jid, 'antilink', true);
+        setGroupSettings(sessionPhone, jid, 'antilink', true);
         await sock.sendMessage(jid, { text: '✅ *Anti-link enabled!* Links will be deleted.' }, { quoted: msg });
       } else if (args === 'off') {
-        setGroupSettings(jid, 'antilink', false);
+        setGroupSettings(sessionPhone, jid, 'antilink', false);
         await sock.sendMessage(jid, { text: '❌ *Anti-link disabled.*' }, { quoted: msg });
       } else {
         const status = current.antilink ? 'ON ✅' : 'OFF ❌';
-        await sock.sendMessage(jid, {
-          text: `🔗 *Anti-link Status:* ${status}\n\n_Use ${config.PREFIX}antilink on/off_`,
-        }, { quoted: msg });
+        await sock.sendMessage(jid, { text: `🔗 *Anti-link Status:* ${status}\n\n_Use ${config.PREFIX}antilink on/off_` }, { quoted: msg });
       }
     },
   },
@@ -475,21 +444,19 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
     category: 'settings',
     groupOnly: true,
     adminOnly: true,
-    handler: async (sock, msg, args) => {
+    handler: async (sock, msg, args, sessionPhone) => {
       const jid = msg.key.remoteJid;
-      const current = getGroupSettings(jid);
+      const current = getGroupSettings(sessionPhone, jid);
 
       if (args === 'on') {
-        setGroupSettings(jid, 'welcome', true);
+        setGroupSettings(sessionPhone, jid, 'welcome', true);
         await sock.sendMessage(jid, { text: '✅ *Welcome messages enabled!*' }, { quoted: msg });
       } else if (args === 'off') {
-        setGroupSettings(jid, 'welcome', false);
+        setGroupSettings(sessionPhone, jid, 'welcome', false);
         await sock.sendMessage(jid, { text: '❌ *Welcome messages disabled.*' }, { quoted: msg });
       } else {
         const status = current.welcome ? 'ON ✅' : 'OFF ❌';
-        await sock.sendMessage(jid, {
-          text: `👋 *Welcome Status:* ${status}\n\n_Use ${config.PREFIX}welcome on/off_`,
-        }, { quoted: msg });
+        await sock.sendMessage(jid, { text: `👋 *Welcome Status:* ${status}\n\n_Use ${config.PREFIX}welcome on/off_` }, { quoted: msg });
       }
     },
   },
@@ -497,7 +464,7 @@ ${metadata.announce ? '🔇 Only admins can send messages' : '🔊 Anyone can se
 
 // ─── Main Message Handler ────────────────────────────────────
 
-async function handleMessage(sock, msg) {
+async function handleMessage(sock, msg, sessionPhone) {
   try {
     const text = getText(msg);
     if (!text) return;
@@ -514,17 +481,16 @@ async function handleMessage(sock, msg) {
 
     const jid = msg.key.remoteJid;
 
-    // Check if command exists
     const cmdObj = commands[cmd];
     if (!cmdObj) return;
 
-    // Check group-only restriction
+    // Group-only check
     if (cmdObj.groupOnly && !isGroup(jid)) {
       await sock.sendMessage(jid, { text: '❌ This command only works in groups.' }, { quoted: msg });
       return;
     }
 
-    // Check admin-only restriction
+    // Admin-only check
     if (cmdObj.adminOnly && isGroup(jid)) {
       const metadata = await sock.groupMetadata(jid);
       const sender = getSenderJid(msg);
@@ -537,8 +503,7 @@ async function handleMessage(sock, msg) {
       }
     }
 
-    // Execute command
-    await cmdObj.handler(sock, msg, args);
+    await cmdObj.handler(sock, msg, args, sessionPhone);
   } catch (error) {
     console.error('Command handler error:', error);
   }
@@ -546,15 +511,14 @@ async function handleMessage(sock, msg) {
 
 // ─── Anti-link Handler ───────────────────────────────────────
 
-async function handleAntiLink(sock, msg) {
+async function handleAntiLink(sock, msg, sessionPhone) {
   try {
     const jid = msg.key.remoteJid;
     if (!isGroup(jid)) return;
 
-    const settings = getGroupSettings(jid);
+    const settings = getGroupSettings(sessionPhone, jid);
     if (!settings.antilink) return;
 
-    // Check if sender is admin
     const metadata = await sock.groupMetadata(jid);
     const sender = getSenderJid(msg);
     const isAdmin = metadata.participants.find(
@@ -562,7 +526,6 @@ async function handleAntiLink(sock, msg) {
     );
     if (isAdmin) return;
 
-    // Check for links
     const linkRegex = /(https?:\/\/|chat\.whatsapp\.com|wa\.me|t\.me|www\.)/i;
     const text = getText(msg);
     if (linkRegex.test(text)) {
@@ -579,25 +542,18 @@ async function handleAntiLink(sock, msg) {
 
 // ─── Welcome Handler ─────────────────────────────────────────
 
-async function handleGroupUpdate(sock, update) {
+async function handleGroupUpdate(sock, update, sessionPhone) {
   try {
     const { id, participants, action } = update;
     if (!isGroup(id)) return;
 
-    const settings = getGroupSettings(id);
+    const settings = getGroupSettings(sessionPhone, id);
     if (!settings.welcome) return;
 
     if (action === 'add') {
       for (const participant of participants) {
-        const text = `
-👋 *Welcome to the group!*
-
-🎉 @${participant.split('@')[0]} has joined!
-
-_Feel free to type ${config.PREFIX}menu to see what I can do._
-        `.trim();
         await sock.sendMessage(id, {
-          text,
+          text: `👋 *Welcome!*\n\n🎉 @${participant.split('@')[0]} has joined!\n\n_Type ${config.PREFIX}menu to see commands._`,
           mentions: [participant],
         });
       }
