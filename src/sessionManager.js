@@ -1,7 +1,6 @@
 /**
  * Session Manager - Handles multiple WhatsApp sessions
  * Each user gets their own Baileys connection + bot instance
- * FIXED: Properly waits for WebSocket connection before requesting pairing code
  */
 
 const {
@@ -21,7 +20,6 @@ const { handleMessage, handleAntiLink, handleGroupUpdate } = require('./commands
 const SESSIONS_DIR = path.join(__dirname, '..', 'sessions');
 const MAX_SESSIONS = 50;
 
-// phone -> { sock, connected, startTime }
 const activeSessions = new Map();
 
 if (!fs.existsSync(SESSIONS_DIR)) {
@@ -47,50 +45,18 @@ function getAllSessions() {
 }
 
 function hasSession(phone) { return activeSessions.has(phone); }
-
 function isSessionConnected(phone) {
   const s = activeSessions.get(phone);
   return s ? s.connected : false;
 }
 
 /**
- * Wait for Baileys WebSocket to connect to WhatsApp servers
- * Returns true if connected, false if timed out
- */
-function waitForWSConnection(sock, maxWaitMs = 15000) {
-  return new Promise((resolve) => {
-    let resolved = false;
-
-    const done = (result) => {
-      if (resolved) return;
-      resolved = true;
-      sock.ev.off('connection.update', handler);
-      resolve(result);
-    };
-
-    const handler = (update) => {
-      // 'connecting' = WS connected, handshaking with WhatsApp
-      // 'open' = fully authenticated (existing session)
-      // Either one means we can call requestPairingCode
-      if (update.connection === 'connecting' || update.connection === 'open') {
-        done(true);
-      }
-    };
-
-    sock.ev.on('connection.update', handler);
-
-    // Safety timeout
-    setTimeout(() => done(false), maxWaitMs);
-  });
-}
-
-/**
  * Set up event handlers for a socket (reused by create + reconnect)
  */
 function setupSocketHandlers(sock, sessionObj, sessionDir, cleanPhone) {
-  // ─── Connection Updates ────────────────────────────────
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update;
+    console.log(`📡 [${cleanPhone}] connection: ${connection || 'waiting'}`);
 
     if (connection === 'close') {
       sessionObj.connected = false;
@@ -106,11 +72,10 @@ function setupSocketHandlers(sock, sessionObj, sessionDir, cleanPhone) {
       }
     } else if (connection === 'open') {
       sessionObj.connected = true;
-      console.log(`✅ [${cleanPhone}] Connected!`);
+      console.log(`✅ [${cleanPhone}] WhatsApp connected!`);
     }
   });
 
-  // ─── Messages ──────────────────────────────────────────
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages) {
@@ -122,15 +87,47 @@ function setupSocketHandlers(sock, sessionObj, sessionDir, cleanPhone) {
     }
   });
 
-  // ─── Group Updates (Welcome/Goodbye) ──────────────────
   sock.ev.on('group-participants.update', async (update) => {
     await handleGroupUpdate(sock, update, cleanPhone);
   });
 }
 
 /**
+ * Try to request pairing code with retries
+ * The WS takes a few seconds to fully connect after socket creation
+ */
+async function requestPairingCodeWithRetry(sock, phone, maxRetries = 4) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`🔗 [${phone}] Attempt ${attempt}/${maxRetries} requesting pairing code...`);
+
+      // Wait before trying (WS needs time to connect + handshake)
+      const delay = attempt === 1 ? 5000 : 3000; // 5s first try, 3s for retries
+      await new Promise(r => setTimeout(r, delay));
+
+      const code = await sock.requestPairingCode(phone);
+
+      if (code) {
+        console.log(`✅ [${phone}] Pairing code: ${code}`);
+        return { code };
+      } else {
+        console.log(`⚠️ [${phone}] No code returned on attempt ${attempt}`);
+      }
+    } catch (error) {
+      console.log(`⚠️ [${phone}] Attempt ${attempt} failed: ${error.message}`);
+
+      // If it's a rate limit, don't retry
+      if (error.message?.includes('429') || error.message?.includes('rate')) {
+        return { error: 'Too many requests. Wait a minute and try again.' };
+      }
+    }
+  }
+
+  return { error: 'Failed to get pairing code after multiple tries. Please try again.' };
+}
+
+/**
  * Create a new WhatsApp session for a user
- * Returns { code } on success, { error } on failure
  */
 async function createSession(phone) {
   const cleanPhone = phone.replace(/\+/g, '').replace(/\s/g, '');
@@ -147,12 +144,18 @@ async function createSession(phone) {
     return { error: 'This number is already paired and connected!' };
   }
 
+  // If there's a pending session for this phone that's not connected, clean it up
+  if (existing && existing.sock && !existing.connected) {
+    try { existing.sock.end(undefined); } catch {}
+    activeSessions.delete(cleanPhone);
+  }
+
   try {
     const sessionDir = getSessionDir(cleanPhone);
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
 
-    console.log(`📦 [${cleanPhone}] Baileys v${version.join('.')}`);
+    console.log(`📦 [${cleanPhone}] Creating session (Baileys v${version.join('.')})`);
 
     const store = makeInMemoryStore({
       logger: pino().child({ level: 'silent', stream: 'store' })
@@ -186,42 +189,18 @@ async function createSession(phone) {
     activeSessions.set(cleanPhone, sessionObj);
     setupSocketHandlers(sock, sessionObj, sessionDir, cleanPhone);
 
-    // ─── Wait for WebSocket to connect to WhatsApp ──────
-    console.log(`🔗 [${cleanPhone}] Waiting for WS connection...`);
-
-    const wsReady = await waitForWSConnection(sock, 15000);
-
-    if (!wsReady) {
-      console.log(`❌ [${cleanPhone}] WS connection timeout`);
-      return { error: 'Could not reach WhatsApp servers. Check internet and try again.' };
-    }
-
-    console.log(`🔗 [${cleanPhone}] WS connected! Requesting pairing code...`);
-
-    // Small settle delay to ensure handshake completes
-    await new Promise(r => setTimeout(r, 2000));
-
-    // ─── Request Pairing Code ────────────────────────────
-    const code = await sock.requestPairingCode(cleanPhone);
-
-    if (code) {
-      console.log(`✅ [${cleanPhone}] Pairing code: ${code}`);
-      return { code };
-    } else {
-      return { error: 'Failed to generate pairing code. Try again.' };
-    }
+    // ─── Request pairing code with retries ─────────────
+    const result = await requestPairingCodeWithRetry(sock, cleanPhone);
+    return result;
 
   } catch (error) {
-    console.error(`❌ [${cleanPhone}] Error:`, error.message);
+    console.error(`❌ [${cleanPhone}] Session error:`, error.message);
 
     if (error.message?.includes('429') || error.message?.includes('rate')) {
       return { error: 'Too many requests. Wait a minute and try again.' };
     }
-    if (error.message?.includes('Timed Out') || error.message?.includes('timeout')) {
-      return { error: 'Connection timed out. Try again.' };
-    }
 
-    return { error: 'Failed to pair. Try again or restart the bot.' };
+    return { error: 'Failed to create session. Please try again.' };
   }
 }
 

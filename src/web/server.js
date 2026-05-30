@@ -231,7 +231,7 @@ function startWebServer() {
       }
 
       btn.disabled = true;
-      btn.innerHTML = '<span class="spinner"></span> Generating code...';
+      btn.innerHTML = '<span class="spinner"></span> Connecting to WhatsApp (15-20s)...';
 
       try {
         const res = await fetch('/api/pair', {
