@@ -5,8 +5,8 @@
  */
 
 const express = require('express');
-const config = require('../config');
-const sessionManager = require('./sessionManager');
+const config = require('../../config');
+const sessionManager = require('../sessionManager');
 
 function startWebServer() {
   const app = express();

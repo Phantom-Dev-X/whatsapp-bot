@@ -4,8 +4,8 @@
  */
 
 const TelegramBot = require('node-telegram-bot-api');
-const config = require('../config');
-const sessionManager = require('./sessionManager');
+const config = require('../../config');
+const sessionManager = require('../sessionManager');
 
 function startTelegramBot() {
   if (!config.TELEGRAM_BOT_TOKEN) {

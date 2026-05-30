@@ -4,8 +4,8 @@
  * Supports multiple sessions (each user has their own bot)
  */
 
-const config = require('../config');
-const Wbails = require('./utils/wbails');
+const config = require('../../config');
+const Wbails = require('../utils/wbails');
 const fs = require('fs');
 const path = require('path');
 
